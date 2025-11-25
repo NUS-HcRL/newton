@@ -13,34 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# solver types
-from ._src.solvers import (
-    SolverBase,
-    SolverFeatherstone,
-    SolverImplicitMPM,
-    SolverMuJoCo,
-    SolverSemiImplicit,
-    SolverStyle3D,
-    SolverVBD,
-    SolverXPBD,
-    SolverRealSim,
-)
+from .builder_realsim import RealSimModelBuilder
+from .model_realsim import RealSimModel
 
 __all__ = [
-    "SolverBase",
-    "SolverFeatherstone",
-    "SolverImplicitMPM",
-    "SolverMuJoCo",
-    "SolverSemiImplicit",
-    "SolverStyle3D",
-    "SolverVBD",
-    "SolverXPBD",
-    "SolverRealSim",
-]
-
-# solver flags
-from ._src.solvers.flags import SolverNotifyFlags
-
-__all__ += [
-    "SolverNotifyFlags",
+    "RealSimModel",
+    "RealSimModelBuilder",
 ]

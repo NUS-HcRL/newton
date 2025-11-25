@@ -27,195 +27,153 @@ from ...geometry.kernels import triangle_closest_point
 from ...sim import Contacts, Control, Model, State
 from ..solver import SolverBase
 
-########################################################################################################################
-#################################################    RealSim Solver    #################################################
-########################################################################################################################
+# TODO: Grab changes from Warp that has fixed the backward pass
+wp.set_module_options({"enable_backward": False})
 
-class SolverRealSim(SolverBase):
-    """
-    RealSim Projective Dynamics Solver.
-    Handles Volumetric (Tetrahedral) and Linear Spring constraints using the
-    Local-Global solve approach.
-    """
+class mat32(matrix(shape=(3, 2), dtype=float32)):
+    pass
 
-    def __init__(
-        self,
-        model: Model, 
-        iterations=10,
-        stiffness_fem: float = 1000.0,
-        stiffness_spring: float = 100.0,
-    ):
+@wp.kernel
+def forward_step(
+    dt: float,
+    gravity: wp.array(dtype=wp.vec3),
+    pos_prev: wp.array(dtype=wp.vec3),
+    pos: wp.array(dtype=wp.vec3),
+    vel: wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=float),
+    external_force: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    inertia: wp.array(dtype=wp.vec3),
+):
+    particle = wp.tid()
+
+    pos_prev[particle] = pos[particle]
+    if not particle_flags[particle] & ParticleFlags.ACTIVE:
+        inertia[particle] = pos_prev[particle]
+        return
+    vel_new = vel[particle] + (gravity[0] + external_force[particle] * inv_mass[particle]) * dt
+    pos[particle] = pos[particle] + vel_new * dt
+    inertia[particle] = pos[particle]
+
+class SolverVBD(SolverBase):
+    
+    def __init__(self, model):
         super().__init__(model)
-        self.model = model
-        self.pd_iterations = iterations
-        self.stiffness_fem = stiffness_fem
-        self.stiffness_spring = stiffness_spring
-        
-        # 1. Builder setup
-        self.pd_matrix_builder = PDMatrixBuilder(model.particle_count)
-        self.linear_solver = PcgSolver(model.particle_count, self.device)
 
-        # 2. Linear System Matrices (L matrix)
-        self.pd_non_diags = SparseMatrixELL()
-        self.pd_diags = wp.zeros(model.particle_count, dtype=float, device=self.device)
-        
-        # The full system matrix A diagonal (M/dt^2 + L_diag)
-        self.A_diags = wp.zeros(model.particle_count, dtype=float, device=self.device)
-        
-        # 3. State Vectors
-        self.dx = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
-        self.rhs = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
-        self.x_prev = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
-        self.x_inertia = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device) # s_n
-        
-        # 4. Precomputed Physics Data
-        self.tet_dm_inv = wp.zeros(model.tet_count, dtype=wp.mat33, device=self.device)
-        self.tet_vols = wp.zeros(model.tet_count, dtype=float, device=self.device)
-        
-        # Helper for preconditioner
-        self.inv_A_diags = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
-
-    def precompute(self):
-        """Builds topology and precomputes rest states."""
-        
-        # A. Compute Rest State (Dm^-1 and Volume)
-        if self.model.tet_count > 0:
-            wp.launch(
-                precompute_tet_rest_kernel,
-                dim=self.model.tet_count,
-                inputs=[self.model.particle_rest_pos, self.model.tet_indices],
-                outputs=[self.tet_dm_inv, self.tet_vols],
-                device=self.device
-            )
-
-        # B. Build Constant Matrix Structure on CPU/Host
-        with wp.ScopedTimer("SolverRealSim::MatrixBuild"):
-            if self.model.tet_count > 0:
-                self.pd_matrix_builder.add_tet_constraints(
-                    self.model.tet_indices, 
-                    self.tet_vols, 
-                    self.stiffness_fem
-                )
-            
-            # Add springs if present in model (assuming model.edge_indices exists)
-            # if self.model.edge_count > 0:
-            #     self.pd_matrix_builder.add_spring_constraints(...)
-            
-            # Finalize matrix (Upload to GPU)
-            self.pd_diags, self.pd_non_diags.num_nz, self.pd_non_diags.nz_ell = \
-                self.pd_matrix_builder.finalize(self.device)
-
+    @override
     def step(self, state_in: State, state_out: State, control: Control, contacts: Contacts, dt: float):
-        
-        # 1. Implicit Integration Prediction (Inertia Step)
-        # Computes s_n (x_inertia) and system diagonal (M/dt^2 + L)
+        if self.handle_self_contact:
+            self.simulate_one_step_no_self_contact(state_in, state_out, control, contacts, dt)
+
+            # [TODO]: to be placed when self contact done.
+            # self.simulate_one_step_with_collisions_penetration_free(state_in, state_out, control, contacts, dt)
+        else:
+            self.simulate_one_step_no_self_contact(state_in, state_out, control, contacts, dt)
+    
+    
+    def simulate_one_step_no_self_contact(
+        self, state_in: State, state_out: State, control: Control, contacts: Contacts, dt: float
+    ):
+    
+        model = self.model
+    
         wp.launch(
-            kernel=init_step_kernel,
-            dim=self.model.particle_count,
+            kernel=forward_step,
             inputs=[
                 dt,
-                self.model.gravity,
-                state_in.particle_f,
-                state_in.particle_qd,
+                model.gravity,
+                self.particle_q_prev,
                 state_in.particle_q,
-                self.x_prev,
-                self.pd_diags,
-                self.model.particle_mass,
+                state_in.particle_qd,
+                self.model.particle_inv_mass,
+                state_in.particle_f,
                 self.model.particle_flags,
+                self.inertia,
             ],
-            outputs=[
-                self.x_inertia,
-                self.A_diags, 
-                self.dx,      # Initial guess for delta (usually 0 or v*dt)
-            ],
+            dim=self.model.particle_count,
             device=self.device,
         )
 
-        # 2. Local-Global Loop
-        for _iter in range(self.pd_iterations):
-            
-            # --- A. Construct Global RHS (b) ---
-            # Initialize RHS with Inertial Term: M/dt^2 * (s_n - x_curr)
+        for _iter in range(self.iterations):
+            self.particle_forces.zero_()
+            self.particle_hessians.zero_()
+
             wp.launch(
-                init_rhs_kernel,
-                dim=self.model.particle_count,
+                kernel=accumulate_contact_force_and_hessian_no_self_contact,
+                dim=self.collision_evaluation_kernel_launch_size,
                 inputs=[
                     dt,
+                    color,
+                    self.particle_q_prev,
                     state_in.particle_q,
-                    self.x_inertia,
-                    self.model.particle_mass,
+                    self.model.particle_colors,
+                    # body-particle contact
+                    self.model.soft_contact_ke,
+                    self.model.soft_contact_kd,
+                    self.model.soft_contact_mu,
+                    self.friction_epsilon,
+                    self.model.particle_radius,
+                    contacts.soft_contact_particle,
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_max,
+                    self.model.shape_material_mu,
+                    self.model.shape_body,
+                    state_out.body_q if self.integrate_with_external_rigid_solver else state_in.body_q,
+                    state_in.body_q if self.integrate_with_external_rigid_solver else None,
+                    self.model.body_qd,
+                    self.model.body_com,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_body_vel,
+                    contacts.soft_contact_normal,
                 ],
-                outputs=[self.rhs],
+                outputs=[self.particle_forces, self.particle_hessians],
                 device=self.device,
             )
-            
-            # --- B. Local Step (Projections) ---
-            # Add Tet Projection Forces to RHS
-            if self.model.tet_count > 0:
-                wp.launch(
-                    eval_tet_pd_kernel,
-                    dim=self.model.tet_count,
-                    inputs=[
-                        state_in.particle_q, 
-                        self.model.tet_indices,
-                        self.tet_dm_inv,
-                        self.tet_vols,
-                        self.stiffness_fem
-                    ],
-                    outputs=[self.rhs],
-                    device=self.device
-                )
-            
-            # Add Spring Projection Forces to RHS
-            if self.model.edge_count > 0:
-                wp.launch(
-                    eval_spring_pd_kernel,
-                    dim=self.model.edge_count,
-                    inputs=[
-                        state_in.particle_q,
-                        self.model.edge_indices,
-                        self.model.edge_rest_lengths,
-                        self.stiffness_spring
-                    ],
-                    outputs=[self.rhs],
-                    device=self.device
-                )
 
-            # --- C. Global Step (Linear Solve) ---
-            # Solve Ax = b. Note that PCG needs a preconditioner.
-            # We assume a simple diagonal preconditioner derived from A_diags.
-            
-            # Prepare Preconditioner (Inverse of A_diag)
-            # Inline kernel or reuse logic to invert A_diags into inv_A_diags
-            # (Simplified: 1.0 / A_diags)
-            
-            self.linear_solver.solve(
-                self.pd_non_diags,
-                self.A_diags,
-                None,     # x0 (dx starts at 0)
-                self.rhs, # b (residual)
-                self.A_diags, # Placeholder for inv_M (should be inv_A_diags in practice)
-                self.dx,  # output delta
-                iterations=10
-            )
-
-            # --- D. State Update ---
             wp.launch(
-                nonlinear_step_kernel,
-                dim=self.model.particle_count,
-                inputs=[state_in.particle_q, self.dx],
+                kernel=solve_trimesh_no_self_contact,
+                inputs=[
+                    dt,
+                    self.model.particle_color_groups[color],
+                    self.particle_q_prev,
+                    state_in.particle_q,
+                    state_in.particle_qd,
+                    self.model.particle_mass,
+                    self.inertia,
+                    self.model.particle_flags,
+                    self.model.tri_indices,
+                    self.model.tri_poses,
+                    self.model.tri_materials,
+                    self.model.tri_areas,
+                    self.model.edge_indices,
+                    self.model.edge_rest_angle,
+                    self.model.edge_rest_length,
+                    self.model.edge_bending_properties,
+                    self.adjacency,
+                    self.particle_forces,
+                    self.particle_hessians,
+                ],
+                outputs=[
+                    state_out.particle_q,
+                ],
+                dim=self.model.particle_color_groups[color].size,
+                device=self.device,
+            )
+
+            wp.launch(
+                kernel=copy_particle_positions_back,
+                inputs=[self.model.particle_color_groups[color], state_in.particle_q],
                 outputs=[state_out.particle_q],
+                dim=self.model.particle_color_groups[color].size,
                 device=self.device,
             )
             
-            # Swap for next iteration
-            state_in.particle_q.assign(state_out.particle_q)
-
-        # 3. Finalize Velocity
         wp.launch(
             kernel=update_velocity,
-            dim=self.model.particle_count,
-            inputs=[dt, self.x_prev, state_out.particle_q],
+            inputs=[dt, self.particle_q_prev, state_out.particle_q],
             outputs=[state_out.particle_qd],
+            dim=self.model.particle_count,
             device=self.device,
         )
+    
