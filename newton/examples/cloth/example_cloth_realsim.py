@@ -2,191 +2,264 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ###########################################################################
-# Example Sim Cloth Hanging
+# Example Sim Cloth Projective Dynamics
 #
-# This simulation demonstrates a simple cloth hanging behavior. A planar cloth
-# mesh is fixed on one side and hangs under gravity, colliding with the ground.
+# This simulation demonstrates twisting a cloth model using the Custom
+# Projective Dynamics (RealSim) solver.
 #
 ###########################################################################
 
+import math
+import os
+import numpy as np
 import warp as wp
+import warp.examples
+from pxr import Usd, UsdGeom
 
 import newton
 import newton.examples
+from newton import ParticleFlags
+
+# --------------------------------------------------------------------------- #
+#                        Rotation Kernels (From Template)                     #
+# --------------------------------------------------------------------------- #
+
+@wp.kernel
+def initialize_rotation(
+    # input
+    vertex_indices_to_rot: wp.array(dtype=wp.int32),
+    pos: wp.array(dtype=wp.vec3),
+    rot_centers: wp.array(dtype=wp.vec3),
+    rot_axes: wp.array(dtype=wp.vec3),
+    t: wp.array(dtype=float),
+    # output
+    roots: wp.array(dtype=wp.vec3),
+    roots_to_ps: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    v_index = vertex_indices_to_rot[wp.tid()]
+
+    p = pos[v_index]
+    rot_center = rot_centers[tid]
+    rot_axis = rot_axes[tid]
+    op = p - rot_center
+
+    # Project point onto rotation axis to find the root
+    root = wp.dot(op, rot_axis) * rot_axis
+    root_to_p = p - root
+
+    roots[tid] = root
+    roots_to_ps[tid] = root_to_p
+
+    if tid == 0:
+        t[0] = 0.0
+
+
+@wp.kernel
+def apply_rotation(
+    # input
+    vertex_indices_to_rot: wp.array(dtype=wp.int32),
+    rot_axes: wp.array(dtype=wp.vec3),
+    roots: wp.array(dtype=wp.vec3),
+    roots_to_ps: wp.array(dtype=wp.vec3),
+    t: wp.array(dtype=float),
+    angular_velocity: float,
+    dt: float,
+    end_time: float,
+    # output
+    pos_0: wp.array(dtype=wp.vec3),
+    pos_1: wp.array(dtype=wp.vec3),
+):
+    cur_t = t[0]
+    if cur_t > end_time:
+        return
+
+    tid = wp.tid()
+    v_index = vertex_indices_to_rot[wp.tid()]
+
+    rot_axis = rot_axes[tid]
+
+    ux = rot_axis[0]
+    uy = rot_axis[1]
+    uz = rot_axis[2]
+
+    theta = cur_t * angular_velocity
+
+    # Rodrigues' rotation formula matrix construction
+    R = wp.mat33(
+        wp.cos(theta) + ux * ux * (1.0 - wp.cos(theta)),
+        ux * uy * (1.0 - wp.cos(theta)) - uz * wp.sin(theta),
+        ux * uz * (1.0 - wp.cos(theta)) + uy * wp.sin(theta),
+        uy * ux * (1.0 - wp.cos(theta)) + uz * wp.sin(theta),
+        wp.cos(theta) + uy * uy * (1.0 - wp.cos(theta)),
+        uy * uz * (1.0 - wp.cos(theta)) - ux * wp.sin(theta),
+        uz * ux * (1.0 - wp.cos(theta)) - uy * wp.sin(theta),
+        uz * uy * (1.0 - wp.cos(theta)) + ux * wp.sin(theta),
+        wp.cos(theta) + uz * uz * (1.0 - wp.cos(theta)),
+    )
+
+    root = roots[tid]
+    root_to_p = roots_to_ps[tid]
+    root_to_p_rot = R * root_to_p
+    p_rot = root + root_to_p_rot
+
+    # Enforce boundary condition on both current and next state
+    pos_0[v_index] = p_rot
+    pos_1[v_index] = p_rot
+
+    if tid == 0:
+        t[0] = cur_t + dt
+
+# --------------------------------------------------------------------------- #
+#                               Example Class                                 #
+# --------------------------------------------------------------------------- #
 
 class Example:
-    def __init__(
-        self,
-        viewer,
-        solver_type: str = "vbd",
-        height=32,
-        width=64,
-    ):
-        # setup simulation parameters first
-        self.solver_type = solver_type
-
-        self.sim_height = height
-        self.sim_width = width
-        self.sim_time = 0.0
-
+    def __init__(self, viewer):
+        # Setup simulation parameters
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-
-        # Configure substeps for RealSim
-        if self.solver_type == "euler":
-            self.sim_substeps = 32
-        elif self.solver_type == "style3d":
-            self.sim_substeps = 2
-        elif self.solver_type == "realsim":
-            # Projective Dynamics is stable, 10 substeps is usually sufficient
-            self.sim_substeps = 10 
-        else:
-            self.sim_substeps = 10
-
-        self.iterations = 10
+        self.sim_substeps = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
+        
+        # PD Solver Parameters
+        self.iterations = 20  # PD often needs fewer iters than XPBD for stiffness, but more for convergence
+        self.stiffness = 5000.0 # Higher stiffness for cloth-like behavior
+
+        self.rot_angular_velocity = math.pi / 3
+        self.rot_end_time = 10
 
         self.viewer = viewer
 
-        if self.solver_type == "style3d":
-            builder = newton.sim.Style3DModelBuilder()
-        else:
-            builder = newton.ModelBuilder()
+        # Load Mesh from USD
+        usd_stage = Usd.Stage.Open(os.path.join(warp.examples.get_asset_directory(), "square_cloth.usd"))
+        usd_geom = UsdGeom.Mesh(usd_stage.GetPrimAtPath("/root/cloth/cloth"))
 
-        if self.solver_type == "euler":
-            ground_cfg = builder.default_shape_cfg.copy()
-            ground_cfg.ke = 1.0e2
-            ground_cfg.kd = 5.0e1
-            builder.add_ground_plane(cfg=ground_cfg)
-        else:
-            builder.add_ground_plane()
+        mesh_points = np.array(usd_geom.GetPointsAttr().Get())
+        mesh_indices = np.array(usd_geom.GetFaceVertexIndicesAttr().Get())
 
-        # common cloth properties
-        common_params = {
-            "pos": wp.vec3(0.0, 0.0, 4.0),
-            "rot": wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), wp.pi * 0.5),
-            "vel": wp.vec3(0.0, 0.0, 0.0),
-            "dim_x": self.sim_width,
-            "dim_y": self.sim_height,
-            "cell_x": 0.1,
-            "cell_y": 0.1,
-            "mass": 0.1,
-            "fix_left": True,
-            "edge_ke": 1.0e1,
-            "edge_kd": 0.0,
-            "particle_radius": 0.05,
-        }
+        vertices = [wp.vec3(v) for v in mesh_points]
+        self.faces = mesh_indices.reshape(-1, 3)
 
-        solver_params = {}
-        if self.solver_type == "euler":
-            solver_params = {
-                "tri_ke": 1.0e3,
-                "tri_ka": 1.0e3,
-                "tri_kd": 1.0e1,
-            }
+        # Build Model
+        scene = newton.ModelBuilder(gravity=0) # Zero gravity to focus on twist
+        scene.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_from_axis_angle(wp.vec3(0, 0, 1), np.pi / 2),
+            scale=0.01,
+            vertices=vertices,
+            indices=mesh_indices,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            density=0.2,
+            # Note: These XPBD parameters (tri_ke, etc.) are ignored by SolverRealSim
+            # but required by the builder API.
+            tri_ke=1.0e3, 
+            tri_ka=1.0e3,
+            tri_kd=2.0e-7,
+            edge_ke=1e-3,
+            edge_kd=1e-4,
+        )
+        scene.color()
+        self.model = scene.finalize()
 
-        elif self.solver_type == "style3d":
-            common_params.pop("edge_ke")
-            solver_params = {
-                "tri_aniso_ke": wp.vec3(1.0e4, 1.0e4, 1.0e3),
-                "edge_aniso_ke": wp.vec3(2.0e-6, 1.0e-6, 5.0e-6),
-            }
+        # Identify boundary points for twisting
+        cloth_size = 50
+        left_side = [cloth_size - 1 + i * cloth_size for i in range(cloth_size)]
+        right_side = [i * cloth_size for i in range(cloth_size)]
+        rot_point_indices = left_side + right_side
 
-        elif self.solver_type == "xpbd":
-            solver_params = {
-                "add_springs": True,
-                "spring_ke": 1.0e3,
-                "spring_kd": 1.0e1,
-            }
+        # Set flags for pinned particles
+        # SolverRealSim respects ParticleFlags.ACTIVE for kinematic integration
+        if len(rot_point_indices):
+            flags = self.model.particle_flags.numpy()
+            for fixed_vertex_id in rot_point_indices:
+                flags[fixed_vertex_id] = flags[fixed_vertex_id] & ~ParticleFlags.ACTIVE
+            self.model.particle_flags = wp.array(flags)
+
+        # --- REPLACING SolverVBD WITH SolverRealSim ---
+        print(f"Initializing Projective Dynamics Solver with stiffness={self.stiffness}")
+        self.solver = newton.solvers.SolverRealSim(
+            self.model,
+            stiffness=self.stiffness
+        )
+        self.solver.iterations = self.iterations
         
-        elif self.solver_type == "realsim":
-            # RealSim ignores standard Newton ke/kd params for construction,
-            # but we need to ensure the builder creates edges/triangles.
-            solver_params = {
-                "add_springs": False, 
-            }
-
-        else:  # self.solver_type == "vbd"
-            solver_params = {
-                "tri_ke": 1.0e3,
-                "tri_ka": 1.0e3,
-                "tri_kd": 1.0e-1,
-            }
-
-        if self.solver_type == "style3d":
-            builder.add_aniso_cloth_grid(**common_params, **solver_params)
-        else:
-            builder.add_cloth_grid(**common_params, **solver_params)
-
-        if self.solver_type == "vbd":
-            builder.color(include_bending=True)
-
-        self.model = builder.finalize()
-        self.model.soft_contact_ke = 1.0e2
-        self.model.soft_contact_kd = 1.0e0
-        self.model.soft_contact_mu = 1.0
-
-        # Instantiate Solvers
-        if self.solver_type == "euler":
-            self.solver = newton.solvers.SolverSemiImplicit(model=self.model)
-        elif self.solver_type == "style3d":
-            self.solver = newton.solvers.SolverStyle3D(
-                model=self.model,
-                iterations=self.iterations,
-            )
-            self.solver.precompute(builder)
-        elif self.solver_type == "xpbd":
-            self.solver = newton.solvers.SolverXPBD(
-                model=self.model,
-                iterations=self.iterations,
-            )
-        elif self.solver_type == "realsim":
-            print("Initializing RealSim Solver (newton.solvers.SolverRealSim)...")
-            # Using the integrated namespace
-            self.solver = newton.solvers.SolverRealSim(
-                model=self.model,
-                iterations=self.iterations,
-                # Cloth hanging relies heavily on bending stiffness
-                stiffness_bending=0.01, 
-                # No tets in a cloth grid, so this won't be used
-                stiffness_fem=0.0, 
-                # Optional: Enable ADMM if you want to test that path
-                use_admm=False
-            )
-            # Important: Build the topology and matrix on the CPU before simulation starts
-            self.solver.precompute()
-            
-        else:  # self.solver_type == "vbd"
-            self.solver = newton.solvers.SolverVBD(model=self.model, iterations=self.iterations)
-
+        # Initialize States
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.collide(self.state_0)
+        self.contacts = self.model.collide(self.state_0) # Required arg, though currently unused by basic PD
+
+        # Setup Rotation Logic
+        rot_axes = [[0, 1, 0]] * len(right_side) + [[0, -1, 0]] * len(left_side)
+        self.rot_point_indices = wp.array(rot_point_indices, dtype=int)
+        self.t = wp.zeros((1,), dtype=float)
+        self.rot_centers = wp.zeros(len(rot_point_indices), dtype=wp.vec3)
+        self.rot_axes = wp.array(rot_axes, dtype=wp.vec3)
+        self.roots = wp.zeros_like(self.rot_centers)
+        self.roots_to_ps = wp.zeros_like(self.rot_centers)
+
+        wp.launch(
+            kernel=initialize_rotation,
+            dim=self.rot_point_indices.shape[0],
+            inputs=[
+                self.rot_point_indices,
+                self.state_0.particle_q,
+                self.rot_centers,
+                self.rot_axes,
+                self.t,
+            ],
+            outputs=[
+                self.roots,
+                self.roots_to_ps,
+            ],
+        )
 
         self.viewer.set_model(self.model)
-
         self.capture()
 
     def capture(self):
+        self.graph = None
         if wp.get_device().is_cuda:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
-        else:
-            self.graph = None
 
     def simulate(self):
+        # Standard collision detection setup (for future compatibility)
+        self.contacts = self.model.collide(self.state_0)
+        
+        # Note: SolverRealSim doesn't support BVH updates in the provided implementation yet
+        # self.solver.rebuild_bvh(self.state_0) 
+
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-
-            # apply forces to the model
             self.viewer.apply_forces(self.state_0)
 
-            self.contacts = self.model.collide(self.state_0)
+            # Apply kinematic rotation to boundaries
+            wp.launch(
+                kernel=apply_rotation,
+                dim=self.rot_point_indices.shape[0],
+                inputs=[
+                    self.rot_point_indices,
+                    self.rot_axes,
+                    self.roots,
+                    self.roots_to_ps,
+                    self.t,
+                    self.rot_angular_velocity,
+                    self.sim_dt,
+                    self.rot_end_time,
+                ],
+                outputs=[
+                    self.state_0.particle_q,
+                    self.state_1.particle_q,
+                ],
+            )
+
+            # Execute Projective Dynamics Step
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
-            # swap states
+            # Swap states
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
@@ -194,43 +267,18 @@ class Example:
             wp.capture_launch(self.graph)
         else:
             self.simulate()
-
         self.sim_time += self.frame_dt
 
-    def test(self):
-        pass
-
     def render(self):
+        if self.viewer is None:
+            return
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
-        self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
-
 if __name__ == "__main__":
-    # Create parser with base arguments
     parser = newton.examples.create_parser()
-
-    # Add solver-specific arguments
-    parser.add_argument(
-        "--solver",
-        help="Type of solver",
-        type=str,
-        choices=["euler", "style3d", "xpbd", "vbd", "realsim"],
-        default="style3d",
-    )
-    parser.add_argument("--width", type=int, default=64, help="Cloth resolution in x.")
-    parser.add_argument("--height", type=int, default=32, help="Cloth resolution in y.")
-
-    # Parse arguments and initialize viewer
+    parser.set_defaults(num_frames=300)
     viewer, args = newton.examples.init(parser)
-
-    # Create example and run
-    example = Example(
-        viewer=viewer,
-        solver_type=args.solver,
-        height=args.height,
-        width=args.width,
-    )
-
+    example = Example(viewer)
     newton.examples.run(example)
